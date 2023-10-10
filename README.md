@@ -2,3 +2,6 @@
 Initial Seed and Threshold Iteration segmentation
 
 ![](https://github.com/Didziokas/BounTI/blob/main/Lizard%20rotate%20resize.gif)
+
+Segmentation results
+![](https://github.com/Didziokas/BounTI/blob/main/Lizard%20Explode.gif)
