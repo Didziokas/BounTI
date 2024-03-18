@@ -13,7 +13,7 @@ Avizo/Amira addon and Windows Standalone Executable do not required these to be 
 
 ### User Guide
 
-In-depth user guide is available [(here)]()
+In-depth user guide is available [here]().
 
 ### Citation
 If you use our code please cite:
