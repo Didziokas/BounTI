@@ -8,7 +8,7 @@ Segmentation Results
 ### Requirements
 
 The code was tested on python=3.7;3.8;3.9;3.10 with the following packaged:
-- numpy, scipy, scikit-image
+- numpy, scipy, scikit-image, nibabel, tifffile
 Avizo/Amira addon and Windows Standalone Executable do not required these to be installed.
 
 ### User Guide
