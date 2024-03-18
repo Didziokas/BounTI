@@ -13,7 +13,7 @@ Avizo/Amira addon and Windows Standalone Executable do not required these to be 
 
 ### Access
 
-- Lizard Example [(Google Drive, 150MB)](https://drive.google.com/file/d/1UmZ710h3OIylqJ-gCHMBGhXw-mKLSIs6/view?usp=drive_link).
+- Lizard Scan [(Google Drive, 150MB)](https://drive.google.com/file/d/1UmZ710h3OIylqJ-gCHMBGhXw-mKLSIs6/view?usp=drive_link).
 - Avizo/Amira Addon [(GitHub)](https://github.com/Didziokas/BounTI/blob/main/Avizo-Amira%20Addon/BounTI.pyscro), [(Google Drive)](https://drive.google.com/file/d/1Bve7ZHuCLbmBp09UOBVaYg1MSxDZkXqf/view?usp=drive_link).
 - Standalone Executable [(Google Drive, 70MB)](https://drive.google.com/drive/folders/1bn20Z5Ox2QUURDm16Qcq7JMmXLVORkhi?usp=drive_link).
 - Python Script [(GitHub)](https://github.com/Didziokas/BounTI/tree/main/Python%20Script), [(Google Drive)](https://drive.google.com/drive/folders/1SVpdfeJhGyz7V_i7r5Wg8LZJX7K0R_dN?usp=drive_link).
