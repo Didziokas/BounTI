@@ -5,4 +5,18 @@ Initial Seed and Threshold Iteration Segmentation
 Segmentation Results
 ![](https://github.com/Didziokas/BounTI/blob/main/Lizard%20explosion.gif)
 
+### Requirements
 
+The code was tested on python=3.7;3.8;3.9;3.10 with the following packaged:
+- numpy, scipy, scikit-image
+Avizo/Amira addon and Windows Standalone Executable do not required these to be installed.
+
+### Citation
+If you use our code please cite:
+```text
+@article{Didziokas2024BounTI, 
+    title={BounTI (Boundary-preserving Threshold Iteration): a user-friendly tool for automatic hard tissue segmentation}, 
+    author={Marius Didziokas, Erwin Pauws, Lars Kölby, Roman H. Khonsari, Mehran Moazen},
+    journal={Journal of Anatomy},
+    year={2024}
+}
