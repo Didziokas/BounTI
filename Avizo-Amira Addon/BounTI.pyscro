@@ -37,7 +37,7 @@ class BoneSegmentation(PyScriptObject):
         self.sradio_boxes = HxPortRadioBox(self,"SD", "Seed Dilation")
         self.sradio_boxes.radio_boxes = [HxPortRadioBox.RadioBox(label="On"),
         HxPortRadioBox.RadioBox(label="Off")]
-        self.sradio_boxes.selected = 0
+        self.sradio_boxes.selected = 1
 
         # Label preservation
         self.lpradio_boxes = HxPortRadioBox(self,"LP", "Label Preservation")
