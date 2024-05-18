@@ -1,4 +1,4 @@
-## BounTI: Boundary-Preserving Threshold Iteration a user-friendly tool for automatic segmentation
+## BounTI (boundary-preserving threshold iteration): A user-friendly tool for automatic hard tissue segmentation [(Paper)](https://onlinelibrary.wiley.com/doi/full/10.1111/joa.14063)
 ### Initial Seed and Threshold Iteration Segmentation
 ![](https://github.com/Didziokas/BounTI/blob/main/Lizard%20rotate%20resize.gif)
 
@@ -27,9 +27,10 @@ In-depth user guide is available [here](https://github.com/Didziokas/BounTI/blob
 ### Citation
 If you use our code please cite:
 ```text
-@article{Didziokas2024BounTI, 
-    title={BounTI (Boundary-preserving Threshold Iteration): a user-friendly tool for automatic hard tissue segmentation}, 
-    author={Marius Didziokas, Erwin Pauws, Lars Kölby, Roman H. Khonsari, Mehran Moazen},
-    journal={Journal of Anatomy},
-    year={2024}
+@article{https://doi.org/10.1111/joa.14063,
+author = {Didziokas, Marius and Pauws, Erwin and Kölby, Lars and Khonsari, Roman H. and Moazen, Mehran},
+title = {BounTI (boundary-preserving threshold iteration): A user-friendly tool for automatic hard tissue segmentation},
+journal = {Journal of Anatomy},
+doi = {https://doi.org/10.1111/joa.14063},
+url = {https://onlinelibrary.wiley.com/doi/abs/10.1111/joa.14063}
 }
