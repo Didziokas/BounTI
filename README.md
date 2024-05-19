@@ -7,7 +7,7 @@
 
 ### Requirements
 
-The code was tested on python=3.7;3.8;3.9;3.10 with the following packaged:
+The code was tested on python=3.7;3.8;3.9;3.10 with the following packages:
 - numpy, scipy, scikit-image, nibabel, tifffile
 
 Avizo/Amira addon and Windows Standalone Executable do not required these to be installed.
