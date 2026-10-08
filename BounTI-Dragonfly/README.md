@@ -3,8 +3,7 @@
 Dragonfly plugin for **BounTI** — *Boundary-preserving Threshold Iteration*,
 a segmentation tool for micro-CT data (Didziokas et al. 2024, *Journal of
 Anatomy* 245:829–841;
-[paper](https://doi.org/10.1111/joa.14174),
-[original project](https://github.com/Didziokas/BounTI)).
+[paper](https://doi.org/10.1111/joa.14063).
 
 The tool starts from the anatomical components that are well separated at a
 very high grey value (the **Initial Threshold**) and iteratively grows them
@@ -236,4 +235,4 @@ If this tool is used toward published research, please cite:
 
 > Didziokas et al. *BounTI: boundary-preserving threshold iteration — a
 > user-friendly tool for micro-CT segmentation*. **Journal of Anatomy**
-> 245:829–841 (2024). https://doi.org/10.1111/joa.14174
+> 245:829–841 (2024). https://doi.org/10.1111/joa.14063
