@@ -1,0 +1,595 @@
+"""BounTI fast segmentation core (numpy/scipy/skimage only, framework-free).
+
+This core implements the algorithm of the STANDALONE Python version
+(BounTI.py) -- per-level, per-segment component annexation -- and keeps the
+approved quirk fixes from the previous fast core:
+
+1. Seed formation: the ``segments`` (NS) largest DISTINCT 6-connected
+   components of (volume > IT) -- or of the nonzero voxels of a supplied
+   seed ``label`` array -- are relabeled 1..NS (auto seed). With
+   ``label_preserve=True`` the label values are used as-is. Optional
+   per-label seed dilation with skimage ``ball(1)`` (a true 1-voxel
+   6-connected cross; BounTI.py used ball(2), which is documented as a
+   1-voxel dilation in the paper/manual -- approved fix).
+2. One-time trim to bbox(volume > TT) UNION bbox(formed_seed). Sound because
+   claim voxels always satisfy volume > CIT >= TT (they come from the open
+   mask), seed voxels are inside bbox(formed_seed), and the final-level CIT
+   equals TT exactly; clipping the per-segment windows to this trim cannot
+   change any claim because (open ∪ segment) pixels never leave the trim, so
+   the windowed connectivity graph is identical.
+3. Threshold sweep with CIT(i) = IT - i*(IT-TT)/NI for i = 0..NI. At each
+   level the open mask is FIXED (BounTI.py recomputes volume_label once per
+   level, so same-level claims by other segments are invisible to it:
+
+       open = (volume > CIT) & (labeled == 0)
+
+   ). For every segment j = 1..NS -- computed CONCURRENTLY on a thread pool
+   (numpy/scipy release the GIL in these C kernels) --
+
+       relab = the connected component of (open ∪ (labeled == j)) restricted
+               to a window, containing segment j's first voxel
+       claim = relab & open
+
+   where the window is segment j's bounding box expanded by 10% of each
+   extent on every side (BounTI.py's bbox2_3D + the 0.1 margins), clipped to
+   the trim. Segments with no open voxels in their window are skipped, as in
+   the original (its claims are then empty).
+   Claims are applied in ASCENDING segment order after the pool finishes,
+   reproducing BounTI.py's loop order exactly: a later (higher-index)
+   segment overwrites a lower one's same-level claim on shared pixels, so
+   the result is deterministic and independent of worker scheduling.
+
+Approved behavior changes retained from the previous fast core (all apply
+to the seed phase and validation only; the growth now follows BounTI.py):
+
+1. Seed Dilation defaults to OFF.
+2. Seed dilation is ball(1), was ball(2) (BounTI.py's grow() also used
+   ball(2)) -- both the original Avizo script and the standalone deviate
+   from the documented 1-voxel dilation; the fix was approved.
+3. get_largest selects the NS largest DISTINCT components (deterministic
+   tie-break); BounTI.py's get_largest re-selects the same component when
+   two have equal voxel counts and corrupts label values.
+4. When fewer components than NS exist, the warning
+   'Number of segments should be reduced to {k}' is emitted (the original's
+   message shape).
+5. Input validation raises ValueError with clear messages (IT > TT,
+   iterations >= 1, segments >= 1, non-empty seed). BounTI.py triggers bare
+   asserts/degenerate reduction errors instead. Additionally, since the
+   output is uint16, segments > 65535 is now rejected instead of wrapping.
+6. A threshold level with an empty open mask is skipped (the original
+   would run its per-segment loop and claim nothing; behavior is the same,
+   this merely avoids the wasted scan).
+7. The transient zeroing of segment j's own voxels in BounTI.py's loop is
+   not performed. In the common case that is a pure no-op (the zeroed
+   voxels are restored by the same iteration's claim write), but when a
+   piece of segment j has been cut off from the rest by a higher segment's
+   claims it is disconnected inside BounTI.py's (open ∪ segment_j) graph,
+   escapes the component re-label, and is left as 0 -- i.e. the original
+   silently erases voxels of a caught-up segment in dispute zones. This
+   core keeps such voxels labeled with their segment instead (claims, as
+   zero-write prevention, only ever land on voxels that were unlabeled at
+   the start of the level, so a segment can never be wholly vanished and
+   BounTI.py's 'missing j' fallback never triggers here). This residual
+   difference favors completeness (no data loss) over bug-for-bug
+   fidelity; every non-dispute case is bit-identical to BounTI.py
+   (verified by verification/test_standalone_equiv.py).
+
+Compared with the previous fast core's wave-front flood, this formulation
+is what BounTI.py produces; where several segments touch one open
+component, ownership of whole merged-window components shifts to the
+highest-index touching segment instead of being decided by directional
+pass order. BounTI.py's per-window margin makes each level's growth
+approximately 10% of each segment's extent, so the per-level cost is
+bounded windows rather than full-volume flood passes.
+
+Progress/cancel contract: progress(fraction, message) is called once per
+level with the 'Refining -- Iter:{i}' message, as before. An Exception
+raised BY the callback cancels the run between levels: in-flight level
+windows are abandoned (their claims discarded) and the partial
+(labeled_volume, formed_seed) is returned. BaseExceptions propagate and
+lose the partial state (the shipped adapters raise RuntimeError).
+
+RAM budget: the pool is sized per level from the largest window
+(workers = min(cores, budget // (8 * max_window_bytes)), clamped to >= 1
+and <= 16), with budget = min(2 GB, a fraction of free physical RAM read
+via GlobalMemoryStatusEx on Windows; 2 GB fallback elsewhere). Peak extra
+memory is therefore dominated by the uint16 label volume plus a few active
+windows (bool temp + int32 connected-component labels + int32 claim
+indices each), independent of the number of segments.
+"""
+
+import ctypes
+import os
+import warnings
+from concurrent.futures import ThreadPoolExecutor
+
+import numpy as np
+from scipy import ndimage as ndi
+from skimage.morphology import ball
+
+
+class _MEMORYSTATUSEX(ctypes.Structure):
+    _fields_ = [
+        ("dwLength", ctypes.c_ulong),
+        ("dwMemoryLoad", ctypes.c_ulong),
+        ("ullTotalPhys", ctypes.c_ulonglong),
+        ("ullAvailPhys", ctypes.c_ulonglong),
+        ("ullTotalPageFile", ctypes.c_ulonglong),
+        ("ullAvailPageFile", ctypes.c_ulonglong),
+        ("ullTotalVirtual", ctypes.c_ulonglong),
+        ("ullAvailVirtual", ctypes.c_ulonglong),
+        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+    ]
+
+
+def _free_ram_bytes():
+    """Free physical RAM, or None when unavailable (non-Windows)."""
+    try:
+        stat = _MEMORYSTATUSEX()
+        stat.dwLength = ctypes.sizeof(_MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(stat)):
+            return int(stat.ullAvailPhys)
+    except Exception:
+        pass
+    return None
+
+
+_MAX_WORKERS_RAM_BUDGET = 2 * 1024 ** 3          # bytes available for windows
+_MAX_WORKERS_HARD_CAP = 16
+
+
+def _level_window(extent, shape):
+    """BounTI.py's window: a segment's bbox expanded by 10% of each extent,
+    clipped to the trim/volume shape.
+
+    ``extent`` is half-open (start, stop) per axis as ndi.find_objects
+    reports it; BounTI.py's bbox2_3D yields INCLUSIVE end indices, so the
+    inclusive end is stop-1, the margin uses int((stop-1-start) * 0.1), and
+    the window slice is [start-m : (stop-1)+m) exactly as BounTI.py writes
+    its region slices. ``extent`` may be None (label not found by
+    find_objects): then the full trim box is used, mirroring the original's
+    fallback when bbox2_3D throws on a missing label."""
+    if extent is None:
+        return (0, shape[0]), (0, shape[1]), (0, shape[2])
+    (z0, z1), (y0, y1), (x0, x1) = extent
+    mz = int((z1 - 1 - z0) * 0.1)
+    my = int((y1 - 1 - y0) * 0.1)
+    mx = int((x1 - 1 - x0) * 0.1)
+    z0, z1 = max(z0 - mz, 0), min(z1 - 1 + mz, shape[0])
+    y0, y1 = max(y0 - my, 0), min(y1 - 1 + my, shape[1])
+    x0, x1 = max(x0 - mx, 0), min(x1 - 1 + mx, shape[2])
+    return (z0, z1), (y0, y1), (x0, x1)
+
+
+def _window_claims(labeled, open_mask, j, extent):
+    """One segment's same-level claims (BounTI.py's per-j body, without the
+    transient zeroing -- see the module docstring for why).
+
+    Returns (j, trim_flat_indices) -- the claim voxels as flat int32 indices
+    into the trim-sized ``labeled`` array -- or (j, None) when the window
+    holds no open voxels (nothing to claim). BounTI.py's empty-segment
+    fallback (index = 1 over a full-volume window) never triggers here:
+    segment labels can never drop to zero voxels because claims only ever
+    write to voxels that were unlabeled at the start of the level (no
+    zeroing is performed, see the module docstring).
+    """
+    shape = labeled.shape
+    zz, yy, xx = _level_window(extent, shape)
+    sl = (slice(zz[0], zz[1]), slice(yy[0], yy[1]), slice(xx[0], xx[1]))
+    o_w = open_mask[sl]
+    seg_w = labeled[sl] == j                       # bool, fresh allocation
+    if not o_w.any() or not seg_w.any():
+        return j, None
+    pos = int(np.argmax(seg_w))                    # first j-pixel, C-order in window —
+                                                   # MUST be taken before the merge below:
+                                                   # `temp = seg_w; temp |= o_w` mutates the
+                                                   # same bool array, and the representative
+                                                   # pixel has to come from the segment itself
+                                                   # (BounTI.py's np.where(reduced == j) before
+                                                   # merging), not from the merged graph.
+    temp = seg_w                                   # merged graph = seg ∪ open
+    temp |= o_w
+    relab_labels = ndi.label(temp)[0]              # 6-connected, as in BounTI.py
+    try:
+        index = int(relab_labels.flat[pos])
+    except Exception:
+        index = 1                                  # the original's fallback
+    try:
+        claim = relab_labels == index
+        claim &= o_w
+    except Exception:
+        print(f"missing {j}")                      # the original's message shape
+        return j, None
+    local = np.flatnonzero(claim.ravel()).astype(np.int64)
+    if local.size == 0:
+        return j, None
+    ny_w, nx_w = yy[1] - yy[0], xx[1] - xx[0]      # window dims (local flat is
+    z = local // (ny_w * nx_w)                     # over the window subarray)
+    y = (local - z * ny_w * nx_w) // nx_w
+    x = local - z * ny_w * nx_w - y * nx_w
+    NYX = shape[1] * shape[2]
+    trim_flat = ((z + zz[0]) * NYX + (y + yy[0]) * shape[2] + (x + xx[0]))
+    return j, trim_flat.astype(np.int32)
+
+
+def _bbox3d(mask):
+    """Half-open bounding box ((z0, z1), (y0, y1), (x0, x1)) of a boolean
+    array via np.any reductions only (no np.argwhere). None when empty."""
+    zs = np.any(mask, axis=(1, 2))
+    if not zs.any():
+        return None
+    ys = np.any(mask, axis=(0, 2))
+    xs = np.any(mask, axis=(0, 1))
+    z0 = int(np.argmax(zs))
+    z1 = int(zs.size - int(np.argmax(zs[::-1])))
+    y0 = int(np.argmax(ys))
+    y1 = int(ys.size - int(np.argmax(ys[::-1])))
+    x0 = int(np.argmax(xs))
+    x1 = int(xs.size - int(np.argmax(xs[::-1])))
+    return ((z0, z1), (y0, y1), (x0, x1))
+
+
+def _union_bbox(a, b):
+    if a is None:
+        return b
+    if b is None:
+        return a
+    return ((min(a[0][0], b[0][0]), max(a[0][1], b[0][1])),
+            (min(a[1][0], b[1][0]), max(a[1][1], b[1][1])),
+            (min(a[2][0], b[2][0]), max(a[2][1], b[2][1])))
+
+
+def _get_largest(seed_mask_region, segments):
+    """Relabel the NS largest distinct 6-connected components to 1..k.
+
+    Ties are broken deterministically by component index (stable sort).
+    Returns (region_labels_uint16, number).
+    """
+    labels, n_components = ndi.label(seed_mask_region)
+    counts = np.bincount(labels.ravel())
+    n_components = min(n_components, counts.size - 1)
+    if n_components < segments:
+        warnings.warn(f"Number of segments should be reduced to {n_components}")
+    number = min(segments, n_components)
+    order = np.argsort(-counts[1:], kind="stable")
+    keep = order[:number]
+    lut = np.zeros(counts.size, dtype=np.uint16)
+    lut[keep + 1] = np.arange(1, number + 1, dtype=np.uint16)
+    return lut[labels], number
+
+
+def _grow(seed, number, structure):
+    """Per-label seed dilation (original grow() order: later labels
+    overwrite). Each label is dilated only inside its bounding-box
+    subvolume expanded by the structuring-element radius."""
+    formed = seed.copy()
+    slices = ndi.find_objects(seed)
+    nz, ny, nx = seed.shape
+    radius = (structure.shape[0] - 1) // 2
+    for i in range(number):
+        lab = i + 1
+        sl = slices[lab - 1] if lab - 1 < len(slices) else None
+        if sl is None:
+            continue
+        (sz, sy, sx) = sl
+        z0, z1 = max(sz.start - radius, 0), min(sz.stop + radius, nz)
+        y0, y1 = max(sy.start - radius, 0), min(sy.stop + radius, ny)
+        x0, x1 = max(sx.start - radius, 0), min(sx.stop + radius, nx)
+        comp = seed[z0:z1, y0:y1, x0:x1] == lab
+        grown = ndi.binary_dilation(comp, structure=structure)
+        formed[z0:z1, y0:y1, x0:x1][grown] = lab
+    return formed
+
+
+def segmentation(volume_array, initial_threshold, target_threshold, segments, iterations, label=None,
+                 label_preserve=False, seed_dilation=False, progress=None):
+    """Fast BounTI segmentation following BounTI.py's algorithm.
+
+    Parameters
+    ----------
+    volume_array : 3D numeric array (any dtype; only comparisons are made)
+    initial_threshold, target_threshold : numbers, IT > TT
+    segments : int >= 1 (NS); must also be <= 65535 (uint16 labels)
+    iterations : int >= 1 (NI)
+    label : optional 3D seed array (uint16); nonzero voxels form the seed.
+        With label_preserve=False the NS largest components of its nonzero
+        mask are recomputed; with True its values are used as-is.
+    label_preserve, seed_dilation : bool flags (see module docstring).
+    progress : optional callback progress(fraction: float, message: str),
+        called once per level. An Exception raised BY the callback cancels
+        the run: in-flight level windows are abandoned and the current
+        partial (labeled_volume, formed_seed) is returned. BaseExceptions
+        propagate (the shipped adapters raise RuntimeError).
+
+    Returns
+    -------
+    (labeled_volume, formed_seed) : two uint16 arrays shaped like volume_array.
+    """
+    volume = np.asarray(volume_array)
+    if volume.ndim != 3:
+        raise ValueError(
+            f"volume_array must be a 3D array, got {volume.ndim} dimensions")
+    if not initial_threshold > target_threshold:
+        raise ValueError(
+            f"initial threshold ({initial_threshold}) must be greater than "
+            f"the target threshold ({target_threshold})")
+    if iterations < 1:
+        raise ValueError(f"iterations must be >= 1, got {iterations}")
+    if segments < 1:
+        raise ValueError(f"segments must be >= 1, got {segments}")
+    if segments > 65535:
+        raise ValueError("segments must be at most 65535 (labels are uint16)")
+
+    # ---- seed formation ------------------------------------------------
+    if label is not None:
+        label = np.asarray(label)
+        if label.shape != volume.shape:
+            raise ValueError(
+                f"seed label shape {label.shape} does not match the volume "
+                f"shape {volume.shape}")
+        if label.dtype != np.uint16:
+            label = label.astype(np.uint16)
+        if not label.any():
+            raise ValueError("the supplied seed label contains no nonzero voxels")
+
+    if label is None or not label_preserve:
+        if label is None:
+            seed_mask = volume > initial_threshold
+            if not seed_mask.any():
+                raise ValueError(f"no voxels above the initial threshold "
+                                 f"({initial_threshold}) -- lower it")
+        else:
+            seed_mask = label != 0
+        sz, sy, sx = _bbox3d(seed_mask)
+        seed = np.zeros(volume.shape, dtype=np.uint16)
+        seed_region, number = _get_largest(
+            seed_mask[sz[0]:sz[1], sy[0]:sy[1], sx[0]:sx[1]], segments)
+        seed[sz[0]:sz[1], sy[0]:sy[1], sx[0]:sx[1]] = seed_region
+        del seed_region, seed_mask
+    else:
+        seed = label.copy()
+        number = segments
+
+    if seed_dilation:
+        formed_seed = _grow(seed, number, ball(1))
+        del seed
+    else:
+        formed_seed = seed
+
+    # ---- one-time trim ---------------------------------------------------
+    above_tt = volume > target_threshold
+    vol_box = _bbox3d(above_tt)
+    del above_tt
+    trim = _union_bbox(vol_box, _bbox3d(formed_seed != 0))
+    (tz0, tz1), (ty0, ty1), (tx0, tx1) = trim
+
+    labeled = np.zeros((tz1 - tz0, ty1 - ty0, tx1 - tx0), dtype=np.uint16)
+    labeled[...] = formed_seed[tz0:tz1, ty0:ty1, tx0:tx1]
+    vol_trim = volume[tz0:tz1, ty0:ty1, tx0:tx1]
+
+    open_buf = np.empty(labeled.shape, dtype=bool)
+    eq_buf = np.empty(labeled.shape, dtype=bool)
+
+    try:
+        free_ram = _free_ram_bytes()
+        budget = _MAX_WORKERS_RAM_BUDGET
+        if free_ram is not None:
+            budget = min(budget, int(free_ram * 0.6))
+        cores = min(_MAX_WORKERS_HARD_CAP, os.cpu_count() or 1)
+
+        for i in range(iterations + 1):
+            if progress is not None:
+                try:
+                    progress(i / (iterations + 1), f"Refining -- Iter:{i}")
+                except Exception:
+                    break  # cancelled: keep the partial state
+            cit = initial_threshold - (
+                i * (initial_threshold - target_threshold) / iterations)
+
+            np.greater(vol_trim, cit, out=open_buf)
+            np.equal(labeled, 0, out=eq_buf)
+            np.logical_and(open_buf, eq_buf, out=open_buf)
+            if not open_buf.any():
+                continue  # nothing to claim at this level
+            slices = ndi.find_objects(labeled)
+
+            # RAM budget: workers sized by the largest window this level.
+            max_w = 0
+            extents = []
+            for j in range(number):
+                sl = slices[j] if j < len(slices) else None
+                ext = None if sl is None else tuple(
+                    (sl[d].start, sl[d].stop) for d in range(3))
+                extents.append(ext)
+                if ext is not None:
+                    w = _level_window(ext, labeled.shape)
+                    max_w = max(max_w, (w[0][1] - w[0][0]) * (w[1][1] - w[1][0])
+                                * (w[2][1] - w[2][0]))
+            workers = int(budget // (8 * max_w + 64 * 1024 ** 2)) if max_w else cores
+            workers = max(1, min(cores, workers))
+
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [
+                    pool.submit(_window_claims, labeled, open_buf, j + 1, extents[j])
+                    for j in range(number)
+                ]
+                claims = {}
+                for fut, j in zip(futures, range(1, number + 1)):
+                    claims[j] = fut.result()[1]
+            # Apply in ascending segment order (the original loop order):
+            # later segments overwrite lower ones' same-level claims.
+            flat_view = labeled.reshape(-1)
+            for j in range(1, number + 1):
+                idx = claims.get(j)
+                if idx is not None:
+                    flat_view[idx] = np.uint16(j)
+            del claims, futures
+    finally:
+        del open_buf, eq_buf
+
+    # Paste the trim region back into the full-size uint16 output.
+    labeled_volume = np.zeros(volume.shape, dtype=np.uint16)
+    labeled_volume[tz0:tz1, ty0:ty1, tx0:tx1] = labeled
+    del labeled
+    return labeled_volume, formed_seed
+
+# ============================================================
+# Avizo/PyScript glue ("BounTI Parallelized", drop-in parallelized
+# version of "BounTI.pyscro": same ports, parameters, ranges and
+# defaults; the algorithm core above is the RAM-aware threaded
+# implementation shared with the Dragonfly addon and
+# BounTI_parallelized.py).
+# ============================================================
+
+
+class BoneSegmentation(PyScriptObject):
+    def __init__(self):
+        import _hx_core
+        _hx_core._tcl_interp('startLogInhibitor')
+
+        # Input port: it will only handle HxUniformScalarField3:
+        self.input = HxConnection(self, "input", "Input Volume")
+        self.input.valid_types = ('HxUniformScalarField3')
+
+        # Input port: it will only handle HxUniformScalarField3:
+        self.inputL = HxConnection(self, "inputL", "Input Label")
+        self.inputL.valid_types = ('HxUniformLabelField3')
+
+
+        # This port will number of segments size.
+        self.n = HxPortIntSlider(self, "n", "Number of Segments")
+        self.n.clamp_range = (1, 100)
+        self.n.value = 14
+
+        # This port will define number of iterations.
+        self.iters = HxPortIntSlider(self, "iters", "Number of Iterations")
+        self.iters.clamp_range = (1, 1000)
+        self.iters.value = 7
+
+        # This port will define initial threshold.
+        self.threshinit = HxPortIntSlider(self, "threshinit", "Initial Threshold")
+        self.threshinit.clamp_range = (0, 100000)
+        self.threshinit.value = 34000
+
+        # This port will define target threshold.
+        self.threshfin = HxPortIntSlider(self, "threshfin", "Target Threshold")
+        self.threshfin.clamp_range = (0, 100000)
+        self.threshfin.value = 21500
+
+
+        # Seed Dilation
+        self.sradio_boxes = HxPortRadioBox(self,"SD", "Seed Dilation")
+        self.sradio_boxes.radio_boxes = [HxPortRadioBox.RadioBox(label="On"),
+        HxPortRadioBox.RadioBox(label="Off")]
+        self.sradio_boxes.selected = 1
+
+        # Label preservation
+        self.lpradio_boxes = HxPortRadioBox(self,"LP", "Label Preservation")
+        self.lpradio_boxes.radio_boxes = [HxPortRadioBox.RadioBox(label="On"),
+        HxPortRadioBox.RadioBox(label="Off")]
+        self.lpradio_boxes.selected = 1
+
+        # Save Seed
+        self.ssradio_boxes = HxPortRadioBox(self,"SS", "Save Seed")
+        self.ssradio_boxes.radio_boxes = [HxPortRadioBox.RadioBox(label="On"),
+        HxPortRadioBox.RadioBox(label="Off")]
+        self.ssradio_boxes.selected = 1
+
+
+        # Classic 'Apply' button:
+        self.do_it = HxPortDoIt(self, "apply", "Apply")
+
+        _hx_core._tcl_interp('stopLogInhibitor')
+
+    def update(self):
+        if not self.inputL.is_new:
+            return
+        if self.inputL.source() is None:
+            self.iters.visible = True
+            self.threshinit.visible = True
+            self.threshfin.visible = True
+            self.sradio_boxes.visible = True
+            self.ssradio_boxes.visible = True
+            self.lpradio_boxes.visible = False
+        elif self.inputL.source is not None:
+            self.iters.visible = True
+            self.threshinit.visible = True
+            self.threshfin.visible = True
+            self.sradio_boxes.visible = True
+            self.ssradio_boxes.visible = True
+            self.lpradio_boxes.visible = True
+        pass
+
+    def compute(self):
+        # Does the user press the 'Apply' button?
+        if not self.do_it.was_hit:
+            return
+
+        # Is there an input data connected?
+        if self.input.source() is None:
+            return
+        # Retrieve the input data.
+        input = self.input.source()
+        labeldata = self.inputL.source()
+        # Check if the output field exists and create it
+        if isinstance(self.results[0], HxRegScalarField3) is False:
+            result = hx_project.create('HxUniformLabelField3')
+            result.name = input.name + ".Segmentation"
+        else:
+            result = self.results[0]
+
+        import numpy as np
+
+        # Retrieve the values:
+        number = self.n.value
+        iters = self.iters.value
+        initial_threshold = self.threshinit.value
+        target_threshold = self.threshfin.value
+        dilation = self.sradio_boxes.selected
+        preservation = self.lpradio_boxes.selected
+        saveseed = self.ssradio_boxes.selected
+
+        if dilation == 0:
+            dilation = True
+        else:
+            dilation = False
+        if preservation == 0:
+            preservation = True
+        else:
+            preservation = False
+        if saveseed == 0:
+            saveseed = True
+        else:
+            saveseed = False
+
+        # Compute our output array:
+        volume_array = np.array(input.get_array(), dtype = np.ushort)
+        if labeldata:
+            labeled = np.array(labeldata.get_array(), dtype=np.ushort)
+        else:
+            labeled = None
+        with hx_progress.progress(iters+1, "Refining") as progress:
+            def progress_adapter(frac, text):
+                hx_progress.set_text(text)
+                progress.current_step = int(round(frac * (iters+1)))
+                if progress.interrupted:
+                    raise RuntimeError("BounTI Parallelized interrupted by user")
+            labeled_volume, formed_seed = segmentation(volume_array,initial_threshold,target_threshold,number,iters,label = labeled,label_preserve=preservation,seed_dilation=dilation,progress = progress_adapter)
+
+        # convert
+        mConvert = hx_project
+        result.set_array(np.array(labeled_volume, dtype = np.ushort))
+        if saveseed:
+            seed = hx_project.create('HxUniformLabelField3')
+            seed.name = input.name + ".Seed"
+            seed.set_array(np.array(formed_seed, dtype=np.ushort))
+            seed.bounding_box = input.bounding_box
+        # Output bounding-box is the same as input bbox.
+        result.bounding_box = input.bounding_box
+
+
+
+
+        # Set as current result.
+        self.results[0] = result
+
